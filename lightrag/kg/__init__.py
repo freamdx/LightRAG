@@ -6,6 +6,7 @@ STORAGE_IMPLEMENTATIONS = {
             "PGKVStorage",
             "MongoKVStorage",
             "OpenSearchKVStorage",
+            "ADBKVStorage",
         ],
         "required_methods": ["get_by_id", "upsert"],
     },
@@ -29,6 +30,7 @@ STORAGE_IMPLEMENTATIONS = {
             "QdrantVectorDBStorage",
             "MongoVectorDBStorage",
             "OpenSearchVectorDBStorage",
+            "ADBVectorStorage",
             # "ChromaVectorDBStorage",
         ],
         "required_methods": ["query", "upsert"],
@@ -40,6 +42,7 @@ STORAGE_IMPLEMENTATIONS = {
             "PGDocStatusStorage",
             "MongoDocStatusStorage",
             "OpenSearchDocStatusStorage",
+            "ADBDocStatusStorage",
         ],
         "required_methods": ["get_docs_by_status"],
     },
@@ -55,6 +58,7 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
     ],
     "RedisKVStorage": ["REDIS_URI"],
     "PGKVStorage": ["POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_DATABASE"],
+    "ADBKVStorage": ["ADB_USER", "ADB_PASSWORD", "ADB_DATABASE"],
     # Graph Storage Implementations
     "NetworkXStorage": [],
     "Neo4JStorage": ["NEO4J_URI", "NEO4J_USERNAME", "NEO4J_PASSWORD"],
@@ -87,6 +91,7 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
         "MONGO_URI",
         "MONGO_DATABASE",
     ],
+    "ADBVectorStorage": ["ADB_USER", "ADB_PASSWORD", "ADB_DATABASE"],
     # Document Status Storage Implementations
     "JsonDocStatusStorage": [],
     "RedisDocStatusStorage": ["REDIS_URI"],
@@ -108,6 +113,7 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
     "OpenSearchVectorDBStorage": [
         "OPENSEARCH_HOSTS",
     ],
+    "ADBDocStatusStorage": ["ADB_USER", "ADB_PASSWORD", "ADB_DATABASE"],
 }
 
 # Storage implementation module mapping
@@ -137,6 +143,9 @@ STORAGES = {
     "OpenSearchDocStatusStorage": ".kg.opensearch_impl",
     "OpenSearchGraphStorage": ".kg.opensearch_impl",
     "OpenSearchVectorDBStorage": ".kg.opensearch_impl",
+    "ADBKVStorage": ".kg.adb_mysql_impl",
+    "ADBVectorStorage": ".kg.adb_mysql_impl",
+    "ADBDocStatusStorage": ".kg.adb_mysql_impl",
 }
 
 
