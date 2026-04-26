@@ -11,10 +11,12 @@ from ..base import (
     DocProcessingStatus,
     DocStatus,
     DocStatusStorage,
+    BaseGraphStorage,
 )
 from ..namespace import NameSpace, is_namespace
 from ..utils import logger
 from ..kg.shared_storage import get_data_init_lock
+from ..types import KnowledgeGraph, KnowledgeGraphNode, KnowledgeGraphEdge
 
 import pipmaster
 
@@ -1248,7 +1250,7 @@ class ADBDocStatusStorage(DocStatusStorage):
         return docs_by_status
 
     async def get_docs_by_statuses(
-            self, statuses: list[DocStatus]
+        self, statuses: list[DocStatus]
     ) -> dict[str, DocProcessingStatus]:
         if not statuses:
             return {}
@@ -1456,8 +1458,8 @@ class ADBDocStatusStorage(DocStatusStorage):
         return documents, total_count
 
     async def get_all_status_counts(self) -> dict[str, int]:
-        sql = """SELECT status, count(*) as count FROM LIGHTRAG_DOC_STATUS 
-               WHERE workspace=%(workspace)s 
+        sql = """SELECT status, count(*) as count FROM LIGHTRAG_DOC_STATUS
+               WHERE workspace=%(workspace)s
                GROUP BY status
               """
         params = {"workspace": self.workspace}
@@ -1506,13 +1508,12 @@ class ADBDocStatusStorage(DocStatusStorage):
             )
             return
 
-        ids_str = ",".join([f"'{id}'" for id in ids])
-        delete_sql = f"DELETE FROM {table_name} WHERE workspace=%(workspace)s AND id IN (%(ids)s)"
+        placeholder, id_params = AnalyticDB.build_in_clause("id", ids)
+        delete_sql = f"DELETE FROM {table_name} WHERE workspace=%(workspace)s AND id IN ({placeholder})"
+        params = {"workspace": self.workspace, **id_params}
 
         try:
-            await self.db.execute(
-                delete_sql, {"workspace": self.workspace, "ids": ids_str}
-            )
+            await self.db.execute(delete_sql, params)
         except Exception as e:
             logger.error(
                 f"[{self.workspace}] Error while deleting records from {self.namespace}: {e}"
@@ -1559,6 +1560,404 @@ class ADBDocStatusStorage(DocStatusStorage):
             )
             await self.db.execute(drop_sql, {"workspace": self.workspace})
 
+            return {"status": "success", "message": "data dropped"}
+        except Exception as e:
+            return {"status": "error", "message": str(e)}
+
+
+@final
+@dataclass
+class ADBGraphStorage(BaseGraphStorage):
+    """AnalyticDB MySQL Graph Storage implementation.
+
+    Stores graph data (nodes and edges) in AnalyticDB MySQL using relational tables.
+    Nodes are stored in LIGHTRAG_GRAPH_NODES table, edges in LIGHTRAG_GRAPH_EDGES table.
+    """
+
+    db: AnalyticDB | None = field(default=None)
+
+    def __post_init__(self):
+        self._max_batch_size = self.global_config.get("embedding_batch_num", 100)
+
+    async def initialize(self):
+        """Initialize database connection and create graph tables if not exist."""
+        async with get_data_init_lock():
+            if self.db is None:
+                self.db = AnalyticDB()
+                await self.db.initdb()
+
+            # Implement workspace priority: ADB.workspace > self.workspace > "default"
+            if self.db.workspace:
+                self.workspace = self.db.workspace
+            elif not hasattr(self, "workspace") or not self.workspace:
+                self.workspace = "default"
+
+            # Create graph tables if not exist
+            for k, v in GRAPH_TABLES.items():
+                try:
+                    result = await self.db.query(
+                        "SELECT 1 FROM information_schema.kepler_meta_tables "
+                        "where table_schema=%(db)s and table_name=lower(%(table)s)",
+                        {"db": self.db.db_config["db"], "table": k},
+                    )
+                    if result is None:
+                        logger.info(
+                            f"AnalyticDB MySQL, Try Creating graph table {k} in database"
+                        )
+                        await self.db.execute(v["ddl"])
+                except Exception as e:
+                    logger.error(
+                        f"AnalyticDB MySQL, Failed to create graph table {k} in database, Got: {e}"
+                    )
+                    raise e
+
+    async def finalize(self):
+        """Close database connection pool."""
+        if self.db is not None:
+            await self.db.close_pool()
+            self.db = None
+
+    async def index_done_callback(self) -> None:
+        """No-op callback for index completion."""
+        pass
+
+    async def has_node(self, node_id: str) -> bool:
+        """Check if a node exists in the graph."""
+        sql = "SELECT COUNT(*) as cnt FROM LIGHTRAG_GRAPH_NODES WHERE workspace=%(workspace)s AND node_id=%(node_id)s"
+        result = await self.db.query(
+            sql, {"workspace": self.workspace, "node_id": node_id}
+        )
+        return result["cnt"] > 0 if result else False
+
+    async def has_edge(self, source_node_id: str, target_node_id: str) -> bool:
+        """Check if an edge exists between two nodes."""
+        sql = "SELECT COUNT(*) as cnt FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s AND source_id=%(source_id)s AND target_id=%(target_id)s"
+        result = await self.db.query(
+            sql,
+            {
+                "workspace": self.workspace,
+                "source_id": source_node_id,
+                "target_id": target_node_id,
+            },
+        )
+        return result["cnt"] > 0 if result else False
+
+    async def node_degree(self, node_id: str) -> int:
+        """Get the degree (number of connected edges) of a node."""
+        sql = """
+            SELECT COUNT(*) as cnt FROM (
+                SELECT target_id FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s AND source_id=%(node_id)s
+                UNION ALL
+                SELECT source_id FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s AND target_id=%(node_id)s
+            ) as edges
+        """
+        result = await self.db.query(
+            sql, {"workspace": self.workspace, "node_id": node_id}
+        )
+        return result["cnt"] if result else 0
+
+    async def edge_degree(self, src_id: str, tgt_id: str) -> int:
+        """Get the total degree of an edge (sum of degrees of its source and target nodes)."""
+        src_degree = await self.node_degree(src_id)
+        tgt_degree = await self.node_degree(tgt_id)
+        return src_degree + tgt_degree
+
+    async def get_node(self, node_id: str) -> dict[str, str] | None:
+        """Get node by its ID, returning only node properties."""
+        sql = "SELECT properties FROM LIGHTRAG_GRAPH_NODES WHERE workspace=%(workspace)s AND node_id=%(node_id)s"
+        result = await self.db.query(
+            sql, {"workspace": self.workspace, "node_id": node_id}
+        )
+        if result and result.get("properties"):
+            return json.loads(result["properties"])
+        return None
+
+    async def get_edge(
+        self, source_node_id: str, target_node_id: str
+    ) -> dict[str, str] | None:
+        """Get edge properties between two nodes."""
+        sql = "SELECT properties FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s AND source_id=%(source_id)s AND target_id=%(target_id)s"
+        result = await self.db.query(
+            sql,
+            {
+                "workspace": self.workspace,
+                "source_id": source_node_id,
+                "target_id": target_node_id,
+            },
+        )
+        if result and result.get("properties"):
+            return json.loads(result["properties"])
+        return None
+
+    async def get_node_edges(self, source_node_id: str) -> list[tuple[str, str]] | None:
+        """Get all edges connected to a node."""
+        sql = """
+            SELECT source_id, target_id FROM LIGHTRAG_GRAPH_EDGES
+            WHERE workspace=%(workspace)s AND (source_id=%(node_id)s OR target_id=%(node_id)s)
+        """
+        results = await self.db.query(
+            sql,
+            {"workspace": self.workspace, "node_id": source_node_id},
+            multirows=True,
+        )
+        if not results:
+            return None
+        return [(row["source_id"], row["target_id"]) for row in results]
+
+    async def upsert_node(self, node_id: str, node_data: dict[str, str]) -> None:
+        """Insert a new node or update an existing node in the graph."""
+        sql = """
+            REPLACE INTO LIGHTRAG_GRAPH_NODES (workspace, node_id, properties, updated_at)
+            VALUES (%(workspace)s, %(node_id)s, %(properties)s, CURRENT_TIMESTAMP)
+        """
+        await self.db.execute(
+            sql,
+            {
+                "workspace": self.workspace,
+                "node_id": node_id,
+                "properties": json.dumps(node_data),
+            },
+        )
+
+    async def upsert_nodes_batch(self, nodes: list[tuple[str, dict[str, str]]]) -> None:
+        """Insert or update multiple nodes in a single batch call."""
+        if not nodes:
+            return
+
+        sql = """
+            REPLACE INTO LIGHTRAG_GRAPH_NODES (workspace, node_id, properties, updated_at)
+            VALUES (%(workspace)s, %(node_id)s, %(properties)s, CURRENT_TIMESTAMP)
+        """
+        datas = [
+            {
+                "workspace": self.workspace,
+                "node_id": node_id,
+                "properties": json.dumps(node_data),
+            }
+            for node_id, node_data in nodes
+        ]
+        await self.db.execute(sql, datas)
+
+    async def upsert_edge(
+        self, source_node_id: str, target_node_id: str, edge_data: dict[str, str]
+    ) -> None:
+        """Insert a new edge or update an existing edge in the graph."""
+        sql = """
+            REPLACE INTO LIGHTRAG_GRAPH_EDGES (workspace, source_id, target_id, properties, updated_at)
+            VALUES (%(workspace)s, %(source_id)s, %(target_id)s, %(properties)s, CURRENT_TIMESTAMP)
+        """
+        await self.db.execute(
+            sql,
+            {
+                "workspace": self.workspace,
+                "source_id": source_node_id,
+                "target_id": target_node_id,
+                "properties": json.dumps(edge_data),
+            },
+        )
+
+    async def upsert_edges_batch(
+        self, edges: list[tuple[str, str, dict[str, str]]]
+    ) -> None:
+        """Insert or update multiple edges in a single batch call."""
+        if not edges:
+            return
+
+        sql = """
+            REPLACE INTO LIGHTRAG_GRAPH_EDGES (workspace, source_id, target_id, properties, updated_at)
+            VALUES (%(workspace)s, %(source_id)s, %(target_id)s, %(properties)s, CURRENT_TIMESTAMP)
+        """
+        datas = [
+            {
+                "workspace": self.workspace,
+                "source_id": src,
+                "target_id": tgt,
+                "properties": json.dumps(edge_data),
+            }
+            for src, tgt, edge_data in edges
+        ]
+        await self.db.execute(sql, datas)
+
+    async def delete_node(self, node_id: str) -> None:
+        """Delete a node from the graph (including all its edges)."""
+        # Delete edges first
+        await self.db.execute(
+            "DELETE FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s AND (source_id=%(node_id)s OR target_id=%(node_id)s)",
+            {"workspace": self.workspace, "node_id": node_id},
+        )
+        # Then delete the node
+        await self.db.execute(
+            "DELETE FROM LIGHTRAG_GRAPH_NODES WHERE workspace=%(workspace)s AND node_id=%(node_id)s",
+            {"workspace": self.workspace, "node_id": node_id},
+        )
+
+    async def remove_nodes(self, nodes: list[str]) -> None:
+        """Delete multiple nodes."""
+        if not nodes:
+            return
+
+        placeholder, params = AnalyticDB.build_in_clause("node_id", nodes)
+        # Delete edges
+        await self.db.execute(
+            f"DELETE FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s AND (source_id IN ({placeholder}) OR target_id IN ({placeholder}))",
+            {"workspace": self.workspace, **params},
+        )
+        # Delete nodes
+        await self.db.execute(
+            f"DELETE FROM LIGHTRAG_GRAPH_NODES WHERE workspace=%(workspace)s AND node_id IN ({placeholder})",
+            {"workspace": self.workspace, **params},
+        )
+
+    async def remove_edges(self, edges: list[tuple[str, str]]) -> None:
+        """Delete multiple edges."""
+        if not edges:
+            return
+
+        for source_id, target_id in edges:
+            await self.db.execute(
+                "DELETE FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s AND source_id=%(source_id)s AND target_id=%(target_id)s",
+                {
+                    "workspace": self.workspace,
+                    "source_id": source_id,
+                    "target_id": target_id,
+                },
+            )
+
+    async def get_all_labels(self) -> list[str]:
+        """Get all labels(entity names) in the graph."""
+        sql = "SELECT DISTINCT node_id FROM LIGHTRAG_GRAPH_NODES WHERE workspace=%(workspace)s ORDER BY node_id"
+        results = await self.db.query(
+            sql, {"workspace": self.workspace}, multirows=True
+        )
+        return [row["node_id"] for row in results] if results else []
+
+    async def get_knowledge_graph(
+        self, node_label: str, max_depth: int = 3, max_nodes: int = 1000
+    ) -> KnowledgeGraph:
+        """Retrieve a connected subgraph of nodes where the label includes the specified node_label."""
+        # BFS traversal to get connected subgraph
+        visited_nodes: set[str] = set()
+        visited_edges: set[tuple[str, str]] = set()
+        queue: list[tuple[str, int]] = [(node_label, 0)]
+        nodes_to_fetch: list[str] = []
+        edges_to_fetch: list[tuple[str, str]] = []
+
+        while queue and len(visited_nodes) < max_nodes:
+            current_node, depth = queue.pop(0)
+            if current_node in visited_nodes or depth > max_depth:
+                continue
+
+            visited_nodes.add(current_node)
+            nodes_to_fetch.append(current_node)
+
+            if depth < max_depth:
+                # Get edges for this node
+                edges = await self.get_node_edges(current_node)
+                if edges:
+                    for src, tgt in edges:
+                        if (src, tgt) not in visited_edges:
+                            visited_edges.add((src, tgt))
+                            edges_to_fetch.append((src, tgt))
+                            # Add neighbor to queue
+                            neighbor = tgt if src == current_node else src
+                            if neighbor not in visited_nodes:
+                                queue.append((neighbor, depth + 1))
+
+        # Fetch node and edge data
+        nodes_data = await self.get_nodes_batch(nodes_to_fetch)
+        edges_data = await self.get_edges_batch(
+            [{"src": src, "tgt": tgt} for src, tgt in edges_to_fetch]
+        )
+
+        # Build KnowledgeGraph object
+        kg_nodes = [
+            KnowledgeGraphNode(id=node_id, labels=[node_id], properties=data)
+            for node_id, data in nodes_data.items()
+        ]
+        kg_edges = [
+            KnowledgeGraphEdge(source=src, target=tgt, type="RELATED", properties=data)
+            for (src, tgt), data in edges_data.items()
+        ]
+
+        return KnowledgeGraph(
+            nodes=kg_nodes, edges=kg_edges, is_truncated=len(visited_nodes) >= max_nodes
+        )
+
+    async def get_all_nodes(self) -> list[dict]:
+        """Get all nodes in the graph."""
+        sql = "SELECT node_id, properties FROM LIGHTRAG_GRAPH_NODES WHERE workspace=%(workspace)s"
+        results = await self.db.query(
+            sql, {"workspace": self.workspace}, multirows=True
+        )
+        if not results:
+            return []
+        return [
+            {"id": row["node_id"], **json.loads(row["properties"])}
+            for row in results
+            if row.get("properties")
+        ]
+
+    async def get_all_edges(self) -> list[dict]:
+        """Get all edges in the graph."""
+        sql = "SELECT source_id, target_id, properties FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s"
+        results = await self.db.query(
+            sql, {"workspace": self.workspace}, multirows=True
+        )
+        if not results:
+            return []
+        return [
+            {
+                "source": row["source_id"],
+                "target": row["target_id"],
+                **json.loads(row["properties"]),
+            }
+            for row in results
+            if row.get("properties")
+        ]
+
+    async def get_popular_labels(self, limit: int = 300) -> list[str]:
+        """Get popular labels(entity names) by node degree (most connected entities)."""
+        sql = """
+            SELECT node_id, COUNT(*) as degree FROM (
+                SELECT source_id as node_id FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s
+                UNION ALL
+                SELECT target_id as node_id FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s
+            ) as all_nodes
+            GROUP BY node_id
+            ORDER BY degree DESC
+            LIMIT %(limit)s
+        """
+        results = await self.db.query(
+            sql, {"workspace": self.workspace, "limit": limit}, multirows=True
+        )
+        return [row["node_id"] for row in results] if results else []
+
+    async def search_labels(self, query: str, limit: int = 50) -> list[str]:
+        """Search labels(entity names) with fuzzy matching."""
+        sql = """
+            SELECT node_id FROM LIGHTRAG_GRAPH_NODES
+            WHERE workspace=%(workspace)s AND node_id LIKE %(query)s
+            ORDER BY node_id
+            LIMIT %(limit)s
+        """
+        results = await self.db.query(
+            sql,
+            {"workspace": self.workspace, "query": f"%{query}%", "limit": limit},
+            multirows=True,
+        )
+        return [row["node_id"] for row in results] if results else []
+
+    async def drop(self) -> dict[str, str]:
+        """Drop all graph data for the current workspace."""
+        try:
+            await self.db.execute(
+                "DELETE FROM LIGHTRAG_GRAPH_EDGES WHERE workspace=%(workspace)s",
+                {"workspace": self.workspace},
+            )
+            await self.db.execute(
+                "DELETE FROM LIGHTRAG_GRAPH_NODES WHERE workspace=%(workspace)s",
+                {"workspace": self.workspace},
+            )
             return {"status": "success", "message": "data dropped"}
         except Exception as e:
             return {"status": "error", "message": str(e)}
@@ -1737,6 +2136,30 @@ VECTOR_TABLES = {
                     file_path TEXT NULL,
                     ANN INDEX idx_content_vector(content_vector),
                     PRIMARY KEY (workspace, id)
+                    )"""
+    },
+}
+
+GRAPH_TABLES = {
+    "LIGHTRAG_GRAPH_NODES": {
+        "ddl": """CREATE TABLE LIGHTRAG_GRAPH_NODES (
+                    workspace VARCHAR(255) NOT NULL,
+                    node_id VARCHAR(512) NOT NULL,
+                    properties JSON NULL DEFAULT CAST('{}' as JSON),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (workspace, node_id)
+                    )"""
+    },
+    "LIGHTRAG_GRAPH_EDGES": {
+        "ddl": """CREATE TABLE LIGHTRAG_GRAPH_EDGES (
+                    workspace VARCHAR(255) NOT NULL,
+                    source_id VARCHAR(512) NOT NULL,
+                    target_id VARCHAR(512) NOT NULL,
+                    properties JSON NULL DEFAULT CAST('{}' as JSON),
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (workspace, source_id, target_id)
                     )"""
     },
 }
