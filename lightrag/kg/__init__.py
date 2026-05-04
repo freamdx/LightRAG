@@ -19,6 +19,7 @@ STORAGE_IMPLEMENTATIONS = {
             "MongoGraphStorage",
             "MemgraphStorage",
             "OpenSearchGraphStorage",
+            "ADBGraphStorage",
         ],
         "required_methods": ["upsert_node", "upsert_edge"],
     },
@@ -84,6 +85,7 @@ STORAGE_ENV_REQUIREMENTS: dict[str, list[str]] = {
         "POSTGRES_PASSWORD",
         "POSTGRES_DATABASE",
     ],
+    "ADBGraphStorage": ["ADB_USER", "ADB_PASSWORD", "ADB_DATABASE"],
     # Vector Storage Implementations
     "NoopVectorDBStorage": [],
     "NanoVectorDBStorage": [],
@@ -156,6 +158,7 @@ STORAGES = {
     "ADBKVStorage": ".kg.adb_mysql_impl",
     "ADBVectorStorage": ".kg.adb_mysql_impl",
     "ADBDocStatusStorage": ".kg.adb_mysql_impl",
+    "ADBGraphStorage": ".kg.adb_mysql_impl",
 }
 
 
