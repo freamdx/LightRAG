@@ -16,9 +16,10 @@ from __future__ import annotations
 import os
 import socket
 import uuid
+from collections.abc import Awaitable, Callable
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Awaitable, Callable
+from typing import Any
 
 import pytest
 
@@ -191,6 +192,22 @@ async def _build_opensearch(_tmp_path) -> Any:
     return storage
 
 
+async def _build_adb(_tmp_path) -> Any:
+    from lightrag.kg.adb_mysql_impl import ADBDocStatusStorage
+
+    _ensure_shared_data()
+
+    with _workspace_env_isolated("ADB_WORKSPACE"):
+        storage = ADBDocStatusStorage(
+            namespace="doc_status",
+            global_config={"embedding_batch_num": 8},
+            embedding_func=_DummyEmbeddingFunc(),
+            workspace=_unique_workspace(),
+        )
+        await storage.initialize()
+    return storage
+
+
 _SERVICE_BACKENDS: tuple[BackendSpec, ...] = (
     BackendSpec(
         name="redis",
@@ -215,6 +232,18 @@ _SERVICE_BACKENDS: tuple[BackendSpec, ...] = (
         build=_build_opensearch,
         probe=lambda: _reachable("localhost", 9200),
         unavailable_hint="no OpenSearch on localhost:9200",
+    ),
+    BackendSpec(
+        name="adb",
+        build=_build_adb,
+        probe=lambda: _reachable(
+            os.getenv("ADB_HOST", "localhost"),
+            int(os.getenv("ADB_PORT", "3306")),
+        ),
+        unavailable_hint=(
+            "no AnalyticDB on localhost:3306 "
+            "(set ADB_HOST/ADB_PORT/ADB_USER/ADB_PASSWORD/ADB_DATABASE)"
+        ),
     ),
 )
 
